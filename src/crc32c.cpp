@@ -37,6 +37,154 @@ using namespace node;
 // Stores the CRC-32 lookup table for the software-fallback implementation
 static uint32_t crc32cTable[8][256];
 
+/* Copyright (c) 2014, Matt Stancliff <matt@genges.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE. */
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <assert.h>
+
+#define POLY UINT64_C(0xad93d23594c935a9)
+static uint64_t crc64tab[8][256];
+static bool isInit = false;
+
+/**
+ * Reflect all bits of a \a data word of \a data_len bytes.
+ *
+ * \param data         The data word to be reflected.
+ * \param data_len     The width of \a data expressed in number of bits.
+ * \return             The reflected data.
+ *****************************************************************************/
+static inline uint_fast64_t crc_reflect(uint_fast64_t data, size_t data_len) {
+    uint_fast64_t ret = data & 0x01;
+
+    for (size_t i = 1; i < data_len; i++) {
+        data >>= 1;
+        ret = (ret << 1) | (data & 0x01);
+    }
+
+    return ret;
+}
+
+/**
+ *  Update the crc value with new data.
+ *
+ * \param crc      The current crc value.
+ * \param data     Pointer to a buffer of \a data_len bytes.
+ * \param data_len Number of bytes in the \a data buffer.
+ * \return         The updated crc value.
+ ******************************************************************************/
+uint64_t crc64slow(uint_fast64_t crc, const void *in_data, const uint64_t len) {
+    const uint8_t *data = (uint8_t *)in_data;
+    bool bit;
+
+    for (uint64_t offset = 0; offset < len; offset++) {
+        uint8_t c = data[offset];
+        for (uint_fast8_t i = 0x01; i & 0xff; i <<= 1) {
+            bit = crc & 0x8000000000000000;
+            if (c & i) {
+                bit = !bit;
+            }
+
+            crc <<= 1;
+            if (bit) {
+                crc ^= POLY;
+            }
+        }
+
+        crc &= 0xffffffffffffffff;
+    }
+
+    crc = crc & 0xffffffffffffffff;
+    return crc_reflect(crc, 64) ^ 0x0000000000000000;
+}
+
+
+/* Fill in a CRC constants table. */
+void crc64s_init(void) {
+    uint64_t crc;
+
+    assert(!isInit);
+
+    /* generate CRCs for all single byte sequences */
+    for (int n = 0; n < 256; n++) {
+        crc64tab[0][n] = crc64slow(0, &n, 1);
+    }
+
+    /* generate nested CRC crc64tab for future slice-by-8 lookup */
+    for (int n = 0; n < 256; n++) {
+        crc = crc64tab[0][n];
+        for (int k = 1; k < 8; k++) {
+            crc = crc64tab[0][crc & 0xff] ^ (crc >> 8);
+            crc64tab[k][n] = crc;
+        }
+    }
+
+    isInit = true;
+}
+
+/* Calculate a non-inverted CRC multiple bytes at a time on a little-endian
+ * architecture. If you need inverted CRC, invert *before* calling and invert
+ * *after* calling.
+ * 64 bit crc = process 8 bytes at once;
+ */
+uint64_t crc64s(uint64_t crc, void *buf, size_t len) {
+    unsigned char *next = (unsigned char *)buf;
+
+    assert(isInit);
+    /* process individual bytes until we reach an 8-byte aligned pointer */
+    while (len && ((uintptr_t)next & 7) != 0) {
+        crc = crc64tab[0][(crc ^ *next++) & 0xff] ^ (crc >> 8);
+        len--;
+    }
+
+    /* fast middle processing, 8 bytes (aligned!) per loop */
+    while (len >= 8) {
+        crc ^= *(uint64_t *)next;
+        crc = crc64tab[7][crc & 0xff] ^
+              crc64tab[6][(crc >> 8) & 0xff] ^
+              crc64tab[5][(crc >> 16) & 0xff] ^
+              crc64tab[4][(crc >> 24) & 0xff] ^
+              crc64tab[3][(crc >> 32) & 0xff] ^
+              crc64tab[2][(crc >> 40) & 0xff] ^
+              crc64tab[1][(crc >> 48) & 0xff] ^
+              crc64tab[0][crc >> 56];
+        next += 8;
+        len -= 8;
+    }
+
+    /* process remaining bytes (can't be larger than 8) */
+    while (len) {
+        crc = crc64tab[0][(crc ^ *next++) & 0xff] ^ (crc >> 8);
+        len--;
+    }
+
+    return crc;
+}
 
 
 /**
@@ -210,7 +358,7 @@ NAN_METHOD(calculateCrc) {
         if (useHardwareCrc) {
             crc = hwCrc32c(initCrc, (const char *)Buffer::Data(buf), (size_t)Buffer::Length(buf));
         } else {
-            crc = swCrc32c(initCrc, (const char *)Buffer::Data(buf), (size_t)Buffer::Length(buf));
+            crc = crc64s(initCrc, (void *)Buffer::Data(buf), (size_t)Buffer::Length(buf));
         }
     } else if (info[1]->IsObject()) {
         Nan::ThrowTypeError("Cannot compute CRC-32C for objects!");
@@ -221,7 +369,7 @@ NAN_METHOD(calculateCrc) {
         if (useHardwareCrc) {
             crc = hwCrc32c(initCrc, (const char *)(*String::Utf8Value(strInput)), (size_t)strInput->Utf8Length());
         } else {
-            crc = swCrc32c(initCrc, (const char *)(*String::Utf8Value(strInput)), (size_t)strInput->Utf8Length());
+            crc = crc64s(initCrc, (void *)(*String::Utf8Value(strInput)), (size_t)strInput->Utf8Length());
         }
     }
 
@@ -235,7 +383,7 @@ NAN_METHOD(calculateCrc) {
  * Initialize the module
  */
 void init(Local<Object> exports) {
-    initCrcTable();
+    crc64s_init();
 
     Nan::SetMethod(exports, "isHardwareCrcSupported", isHardwareCrcSupported);
     Nan::SetMethod(exports, "calculateCrc", calculateCrc);
